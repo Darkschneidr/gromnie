@@ -43,6 +43,36 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  wasm:
+    name: wasm32 build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain with wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+
+      # Mirrors the Deploy workflow's web Docker image build. This target is
+      # not covered by the workspace-wide check above, and mio (pulled in via
+      # tokio's `net` feature) does not compile for wasm32-unknown-unknown.
+      - name: Build gromnie-web for wasm32
+        run: cargo build -p gromnie-web --target wasm32-unknown-unknown
+
   prek:
     name: Prek hooks
     runs-on: ubuntu-latest
