@@ -51,7 +51,10 @@ async fn test_timeout_configuration_and_behavior() {
     println!("✓ Timeout configuration test passed");
 }
 
-#[tokio::test]
+// Run on tokio's paused (virtual) clock so timing assertions are
+// deterministic and immune to slow/loaded CI runners. This matches the
+// pattern already used in src/timer.rs.
+#[tokio::test(start_paused = true)]
 async fn test_timeout_mechanism_with_mock_function() {
     // Test the core timeout mechanism using tokio::time::timeout directly
     // This simulates what happens in the ScriptRunner
@@ -66,40 +69,40 @@ async fn test_timeout_mechanism_with_mock_function() {
 
     // Test that fast operation completes within timeout
     let timeout = Duration::from_millis(50);
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
     let result = tokio::time::timeout(timeout, fast_operation()).await;
-    let elapsed = start.elapsed();
+    let fast_elapsed = start.elapsed();
 
     assert!(result.is_ok(), "Fast operation should not timeout");
     assert!(
-        elapsed < Duration::from_millis(100),
+        fast_elapsed < Duration::from_millis(100),
         "Fast operation should complete quickly"
     );
 
     // Test that slow operation times out
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
     let result = tokio::time::timeout(timeout, slow_operation()).await;
-    let elapsed = start.elapsed();
+    let slow_elapsed = start.elapsed();
 
     assert!(result.is_err(), "Slow operation should timeout");
     assert!(
-        elapsed >= timeout,
+        slow_elapsed >= timeout,
         "Should wait at least the timeout duration"
     );
     assert!(
-        elapsed < Duration::from_millis(100),
+        slow_elapsed < Duration::from_millis(100),
         "Should not wait much longer than timeout"
     );
 
     println!("✓ Timeout mechanism test passed");
-    println!("  - Fast operation completed in {:?}", elapsed);
+    println!("  - Fast operation completed in {:?}", fast_elapsed);
     println!(
         "  - Slow operation timed out after {:?} (expected ~{:?})",
-        elapsed, timeout
+        slow_elapsed, timeout
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_multiple_concurrent_timeouts() {
     // Test that multiple operations with timeouts work correctly
 
@@ -115,7 +118,7 @@ async fn test_multiple_concurrent_timeouts() {
         operation_with_duration(150), // Should timeout
     ];
 
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
     let mut results = Vec::new();
 
     // Run all operations with timeout (simulates what ScriptRunner does)
@@ -147,7 +150,7 @@ async fn test_multiple_concurrent_timeouts() {
     println!("  - Total time: {:?}", elapsed);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_script_runner_with_timeout_integration() {
     // Test that ScriptRunner can be created and configured with timeouts
     // This tests the integration without requiring actual WASM scripts
@@ -180,7 +183,7 @@ async fn test_script_runner_with_timeout_integration() {
         message_type: 0,
     }));
 
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
     runner.handle_event(event).await;
     let elapsed = start.elapsed();
 
