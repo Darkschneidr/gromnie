@@ -2,6 +2,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
+#[cfg(not(target_arch = "wasm32"))]
 use tracing::debug;
 
 use crate::client::ServerInfo;
