@@ -115,6 +115,8 @@ pub struct Client {
     pub(crate) pending_auto_login: Option<gromnie_events::SimpleClientAction>,
     /// Cached trade registration data (set when server sends TradeRegisterTrade)
     pub(crate) pending_trade: Option<PendingTradeState>,
+    /// Set by `ClientCommand::DisconnectClean`: send a Disconnect packet when the loop exits.
+    pub(crate) send_disconnect_on_exit: bool,
 }
 
 /// Cached state from a server TradeRegisterTrade event, needed to accept the trade
@@ -243,6 +245,7 @@ impl Client {
             game_action_rx,
             ddd_response: None,
             known_characters: Vec::new(),
+            send_disconnect_on_exit: false,
             reconnect_config,
             reconnect_attempt_count: 0,
             reconnect_at: None,
@@ -712,6 +715,62 @@ impl Client {
 
         // TimeSync: includeSequence=false, incrementSequence=false (like actestclient line 678)
         self.send_packet(packet, false, false).await
+    }
+
+    /// Queue a pre-built outgoing message for the network loop.
+    pub(crate) fn queue_outgoing(&mut self, content: OutgoingMessageContent) {
+        self.outgoing_message_queue
+            .push_back(OutgoingMessage::new(content));
+    }
+
+    /// Send a bare Disconnect (0x8000) packet. ACE terminates the session on receipt.
+    pub(crate) async fn send_disconnect_packet(&mut self) -> Result<(), std::io::Error> {
+        let (client_id, table) = match self.session.connection.as_ref() {
+            Some(c) => (c.client_id, c.table),
+            None => return Ok(()),
+        };
+        let (recipient_id, iteration) = if client_id > 0 { (client_id, table) } else { (0, 0) };
+        let packet = C2SPacket {
+            sequence: 0,
+            flags: PacketHeaderFlags::DISCONNECT,
+            checksum: 0,
+            recipient_id,
+            time_since_last_packet: 0,
+            size: 0,
+            iteration,
+            server_switch: None,
+            retransmit_sequences: None,
+            reject_sequences: None,
+            ack_sequence: None,
+            login_request: None,
+            world_login_request: None,
+            connect_response: None,
+            cicmd_command: None,
+            time: None,
+            echo_time: None,
+            flow: None,
+            fragments: None,
+        };
+        info!(target: "net", "Sending Disconnect packet");
+        self.send_packet(packet, false, false).await
+    }
+
+    /// Handle Communication_TurbineChat (0xF7DE).
+    fn handle_turbine_chat(&mut self, message: RawMessage) {
+        match parse_turbine_chat(&message.data) {
+            Some(Some((room_id, sender_name, message, speaker_id, chat_type))) => {
+                info!(target: "net", "TurbineChat type={} from={}", chat_type, sender_name);
+                self.emit_protocol(gromnie_events::S2CEvent::TurbineChat {
+                    room_id,
+                    sender_name,
+                    message,
+                    speaker_id,
+                    chat_type,
+                });
+            }
+            Some(None) => debug!(target: "net", "TurbineChat non-event blob ignored"),
+            None => warn!(target: "net", "TurbineChat parse failed ({} bytes)", message.data.len()),
+        }
     }
 
     /// Get the client ID
@@ -1304,8 +1363,9 @@ impl Client {
                 match msg_type {
                     S2CMessage::OrderedGameEvent => {
                         // Parse nested event type here instead of deferring
-                        if message.data.len() >= 12 {
-                            let mut cursor = Cursor::new(&message.data[8..]); // Skip outer opcode + seq
+                        // Layout: opcode F7B0 (4) | object_id (4) | sequence (4) | event_type (4) | payload
+                        if message.data.len() >= 16 {
+                            let mut cursor = Cursor::new(&message.data[12..]); // Skip opcode + object_id + sequence
                             match u32::read(&mut cursor) {
                                 Ok(event_opcode) => match GameEventType::try_from(event_opcode) {
                                     Ok(event_type) => self.handle_game_event(event_type, message),
@@ -1362,6 +1422,11 @@ impl Client {
                         .ok();
                     }
                     S2CMessage::CommunicationTextboxString => self.handle_chat_message(message),
+                    S2CMessage::CommunicationTurbineChat => self.handle_turbine_chat(message),
+                    S2CMessage::LoginLogOffCharacter => {
+                        info!(target: "net", "Server confirmed character logoff");
+                        self.emit_protocol(gromnie_events::S2CEvent::CharacterLogOff);
+                    }
                     S2CMessage::CommunicationHearSpeech => {
                         dispatch_message::<asheron_rs::messages::s2c::CommunicationHearSpeech, _>(
                             self, message,
@@ -1449,8 +1514,8 @@ impl Client {
         }
 
         // Parse object_id and sequence from message header using acprotocol parsing
-        // OrderedGameEvent format: object_id (4 bytes) + sequence (4 bytes) + event_data
-        let mut cursor = Cursor::new(&message.data);
+        // OrderedGameEvent format: opcode (4) + object_id (4) + sequence (4) + event_type (4) + event_data
+        let mut cursor = Cursor::new(&message.data[4..]);
 
         let object_id = match u32::read(&mut cursor) {
             Ok(id) => id,
@@ -1467,6 +1532,11 @@ impl Client {
                 return;
             }
         };
+        // Skip the event type (already decoded by the caller) so the cursor sits on the payload.
+        if u32::read(&mut cursor).is_err() {
+            error!(target: "net", "OrderedGameEvent missing event type");
+            return;
+        }
 
         let event_tx = self.raw_event_tx.clone();
         match event_type {
@@ -1874,6 +1944,24 @@ impl Client {
                 Ok(s2c_packet) => {
                     if let Some(blob_fragments) = s2c_packet.fragments {
                         self.handle_fragment(blob_fragments);
+                        // A packet can carry several fragments back to back; the generated
+                        // S2CPacket reader only takes the first. Read the rest here.
+                        let mut extra = 0;
+                        while (cursor.position() as usize) + 16 <= size {
+                            match BlobFragments::read(&mut cursor) {
+                                Ok(frag) => {
+                                    extra += 1;
+                                    self.handle_fragment(frag);
+                                }
+                                Err(e) => {
+                                    warn!(target: "net", "Failed to read trailing fragment: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        if extra > 0 {
+                            debug!(target: "net", "Processed {} additional fragment(s) in packet", extra);
+                        }
                     } else {
                         warn!(target: "net", "BLOB_FRAGMENTS flag set but no fragments in packet");
                     }
@@ -2540,5 +2628,99 @@ mod tests {
         // And back off turns the gate off again.
         client.set_login_retry(false);
         assert!(!client.should_retry());
+    }
+}
+
+
+/// Parse a Communication_TurbineChat (0xF7DE) message (including its opcode) using the
+/// layout ACE's GameMessageTurbineChat writes. Returns `Some(None)` for non-event blobs
+/// (e.g. send acknowledgements) and `None` if the bytes are malformed.
+pub fn parse_turbine_chat(d: &[u8]) -> Option<Option<(u32, String, String, u32, u32)>> {
+    fn u32_at(d: &[u8], p: &mut usize) -> Option<u32> {
+        let v = d.get(*p..*p + 4)?;
+        *p += 4;
+        Some(u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+    }
+    fn wstr_at(d: &[u8], p: &mut usize) -> Option<String> {
+        let b0 = *d.get(*p)? as usize;
+        *p += 1;
+        let len = if b0 & 0x80 != 0 {
+            let b1 = *d.get(*p)? as usize;
+            *p += 1;
+            ((b0 & 0x7F) << 8) | b1
+        } else {
+            b0
+        };
+        let raw = d.get(*p..*p + len * 2)?;
+        *p += len * 2;
+        let units: Vec<u16> = raw.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        Some(String::from_utf16_lossy(&units))
+    }
+    let mut p = 4usize; // opcode
+    let _size = u32_at(d, &mut p)?;
+    let blob_type = u32_at(d, &mut p)?;
+    let dispatch = u32_at(d, &mut p)?;
+    for _ in 0..5 {
+        u32_at(d, &mut p)?; // target type/id, transport type/id, cookie
+    }
+    let _payload = u32_at(d, &mut p)?;
+    if blob_type != 1 || dispatch != 1 {
+        return Some(None);
+    }
+    let room_id = u32_at(d, &mut p)?;
+    let sender_name = wstr_at(d, &mut p)?;
+    let text = wstr_at(d, &mut p)?;
+    let _extra = u32_at(d, &mut p)?;
+    let speaker_id = u32_at(d, &mut p)?;
+    let _hresult = u32_at(d, &mut p)?;
+    let chat_type = u32_at(d, &mut p)?;
+    Some(Some((room_id, sender_name, text, speaker_id, chat_type)))
+}
+
+#[cfg(test)]
+mod turbine_chat_tests {
+    use super::parse_turbine_chat;
+
+    /// Mirror of ACE GameMessageTurbineChat (NETBLOB_EVENT_BINARY / SendToRoomChatEvent).
+    fn ace_bytes(channel: u32, sender: &str, msg: &str, sender_id: u32, chat_type: u32) -> Vec<u8> {
+        let mut w = Vec::new();
+        w.extend(0xF7DEu32.to_le_bytes());
+        w.extend(0u32.to_le_bytes()); // size (not checked)
+        w.extend(1u32.to_le_bytes());
+        w.extend(1u32.to_le_bytes());
+        for v in [1u32, 0x000B00B5, 1, 0x000B00B5, 0, 0] {
+            w.extend(v.to_le_bytes());
+        }
+        w.extend(channel.to_le_bytes());
+        for s in [sender, msg] {
+            let n = s.encode_utf16().count();
+            if n < 128 { w.push(n as u8); } else { w.extend(((0x80 | (n << 8)) as u16).to_le_bytes()); }
+            for u in s.encode_utf16() { w.extend(u.to_le_bytes()); }
+        }
+        w.extend(0x0Cu32.to_le_bytes());
+        w.extend(sender_id.to_le_bytes());
+        w.extend(0u32.to_le_bytes());
+        w.extend(chat_type.to_le_bytes());
+        w
+    }
+
+    #[test]
+    fn parses_general_line() {
+        let b = ace_bytes(0x0B00_0002, "Example Player", "hello, anyone around?", 0x5000_0001, 2);
+        let (room, name, text, id, ct) = parse_turbine_chat(&b).unwrap().unwrap();
+        assert_eq!((room, name.as_str(), text.as_str(), id, ct), (0x0B00_0002, "Example Player", "hello, anyone around?", 0x5000_0001, 2));
+    }
+
+    #[test]
+    fn non_event_blob_is_ignored() {
+        let mut b = ace_bytes(1, "a", "b", 1, 2);
+        b[8] = 5; // NETBLOB_RESPONSE_BINARY
+        assert_eq!(parse_turbine_chat(&b), Some(None));
+    }
+
+    #[test]
+    fn truncated_is_none() {
+        let b = ace_bytes(1, "abc", "hello", 1, 3);
+        assert_eq!(parse_turbine_chat(&b[..b.len() - 3]), None);
     }
 }
